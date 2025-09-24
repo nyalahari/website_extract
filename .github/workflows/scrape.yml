@@ -29,10 +29,9 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Run scraper (force ignore robots)
+    - name: Run scraper
       env:
         URL: "https://www.anirdesh.com/harililamrut/index.php?kalash=1&vishram=1"
-        IGNORE_ROBOTS: "1"
       run: |
         python fetch_to_md.py "$URL" harililamrut_kalash1_vishram1.md
 
