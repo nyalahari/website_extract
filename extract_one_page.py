@@ -1,33 +1,29 @@
 #!/usr/bin/env python3
 """
-extract_harililamrut_onepage.py
+extract_harililamrut_onepage_v2.py
 
-Single-page extractor (no robots check).
-- Removes top "Kalash X / Vishram Y" heading if present.
-- Removes the bottom navigation table (the <table style="margin:auto"> block linking to other sections).
-- Replaces inline footnote links with plain bracketed numbers like [1].
-- Extracts footnotes from <div id="footnotes" class="footnotes"> and appends them under "## Footnotes".
-- Converts cleaned HTML to Markdown and writes to output file.
+Improved one-page extractor for Harililamrut (no robots check).
+- Removes huge navigation blocks & bottom nav table
+- Replaces inline footnote links with [n]
+- Extracts footnotes from <div id="footnotes" ...> and outputs per-page footnotes
+- Converts to Markdown.
 
 Usage:
-  python extract_harililamrut_onepage.py "<PAGE_URL>" [output.md]
-
-Dependencies:
-  pip install requests beautifulsoup4 lxml markdownify
+  python extract_harililamrut_onepage_v2.py "<URL>" [output.md]
 """
-import sys
-import re
-import time
+import sys, re, time
 from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup, NavigableString
 from markdownify import markdownify as md
 
-# ---------- CONFIG ----------
-USER_AGENT = ("Mozilla/5.0 (compatible; HarililamrutOnePage/1.0; +https://github.com/yourname) "
+# -------- CONFIG ----------
+USER_AGENT = ("Mozilla/5.0 (compatible; HarililamrutOnePageV2/1.0; +https://github.com/you) "
               "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 REQUEST_TIMEOUT = 25
-# ----------------------------
+NAV_KEYWORDS = ["વિશ્રામ", "કળશ", "Kalash", "Vishram"]  # keywords often in the big nav block
+MAX_LINKS_IN_BLOCK = 12    # block with more than this many small links is likely a nav block
+# --------------------------
 
 NAV_LINK_PATTERNS = [
     "/vachanamrut/", "/vato/", "/kirtan/", "/kavya/",
@@ -41,10 +37,6 @@ def fetch_html(url):
     return r.content
 
 def remove_top_kalash_heading(soup):
-    """
-    Remove visible headings like "Kalash 1 / Vishram 1" (any heading matching that pattern).
-    Case-insensitive.
-    """
     pattern = re.compile(r"kalash\s*\d+\s*/\s*vishram\s*\d+", re.I)
     for htag in ("h1","h2","h3","h4"):
         for h in soup.find_all(htag):
@@ -55,168 +47,204 @@ def remove_top_kalash_heading(soup):
     return False
 
 def remove_nav_table(soup):
-    """
-    Remove the navigation table with style 'margin:auto' and/or that contains the known nav links.
-    """
     removed = False
     for table in list(soup.find_all("table")):
-        # Check style contains margin:auto (ignore whitespace/case)
         style = (table.get("style") or "").replace(" ", "").lower()
         if "margin:auto" in style:
             table.decompose()
             removed = True
             continue
-
-        # Otherwise check anchors inside the table for known nav hrefs
         anchors = table.find_all("a")
         for a in anchors:
             href = a.get("href") or ""
-            # Normalize and check if any known nav substring is present
             if any(p in href for p in NAV_LINK_PATTERNS):
                 table.decompose()
                 removed = True
                 break
     return removed
 
+def remove_large_nav_blocks(soup):
+    """
+    Remove blocks that look like large navigation lists:
+    - contain many <a> tags (over MAX_LINKS_IN_BLOCK),
+    - or contain repeated NAV_KEYWORDS occurrences
+    We target <div>, <nav>, <aside>, or big <ul> containers.
+    """
+    removed_any = False
+    candidates = soup.find_all(['div', 'nav', 'aside', 'ul', 'section'], recursive=True)
+    for el in candidates:
+        anchors = el.find_all('a')
+        if len(anchors) >= MAX_LINKS_IN_BLOCK:
+            # Check average anchor text length (nav links tend to be short)
+            avg_len = sum(len(a.get_text(strip=True)) for a in anchors) / max(1, len(anchors))
+            short_links = sum(1 for a in anchors if len(a.get_text(strip=True)) < 40)
+            if short_links >= max(10, int(0.8 * len(anchors))) or avg_len < 40:
+                # also avoid removing main content accidentally: ensure links are mostly internal
+                internal = sum(1 for a in anchors if (a.get('href') or "").startswith("index.php") or (a.get('href') or "").startswith("/"))
+                if internal >= max(5, int(0.5 * len(anchors))):
+                    el.decompose()
+                    removed_any = True
+                    continue
+        # check for repeated keywords in text
+        txt = el.get_text(" ", strip=True)
+        keyword_hits = sum(txt.count(k) for k in NAV_KEYWORDS)
+        if keyword_hits >= 6:  # heuristic threshold
+            el.decompose()
+            removed_any = True
+    return removed_any
+
 def extract_footnotes(soup):
     """
-    Extract footnotes from <div id="footnotes" ...> (or class 'footnotes').
-    Return a list of dicts: [{'id': id_or_generated, 'num': n, 'html': inner_html}, ...]
-    Remove the footnotes div from the soup.
+    Extract footnotes from <div id="footnotes" ...> or class contains 'footnotes'.
+    Return list of dicts [{'id': id, 'num': n, 'html': cleaned_html, 'text': fallback_text}, ...]
     """
     footnotes_div = soup.find("div", id="footnotes") or soup.find("div", class_=lambda v: v and "footnotes" in v)
-    results = []
     if not footnotes_div:
-        return results
+        return []
 
-    # Prefer enumerating <li> items if present
+    results = []
+    # Look for ordered list items inside
     ol = footnotes_div.find("ol")
     if ol:
         items = ol.find_all("li", recursive=False)
         for i, li in enumerate(items, start=1):
-            fid = li.get("id") or f"fn-{i}"
-            # inner HTML of li
-            inner = "".join(str(c) for c in li.contents).strip()
-            results.append({"id": fid, "num": i, "html": inner})
-    else:
-        # fallback: find direct children that look like footnote entries (li/div/p)
-        candidates = []
-        for child in footnotes_div.find_all(recursive=False):
-            if child.name in ("li","div","p"):
-                candidates.append(child)
-        if candidates:
-            for i, el in enumerate(candidates, start=1):
-                fid = el.get("id") or f"fn-{i}"
-                inner = "".join(str(c) for c in el.contents).strip()
-                results.append({"id": fid, "num": i, "html": inner})
-        else:
-            # last fallback: take entire footnotes_div as a single footnote
-            inner = "".join(str(c) for c in footnotes_div.contents).strip()
-            results.append({"id": footnotes_div.get("id") or "fn-1", "num": 1, "html": inner})
+            # remove backrefs and sup/backlink anchors inside the footnote
+            for back in li.find_all('a'):
+                href = (back.get('href') or "")
+                cls = " ".join(back.get('class') or [])
+                if href.startswith("#") or 'back' in cls.lower() or 'reverse' in cls.lower() or 'fnref' in cls.lower():
+                    back.decompose()
+            for sup in li.find_all('sup'):
+                # if sup only contains a small anchor or number, drop it
+                if not sup.get_text(strip=True):
+                    sup.decompose()
+                else:
+                    # if sup contains backlink, remove
+                    if sup.find('a'):
+                        sup.decompose()
 
-    # remove footnotes div so it is not duplicated in main content
+            inner_html = "".join(str(c) for c in li.contents).strip()
+            # convert to markdown; if empty, fallback to plain text
+            converted = md(inner_html, heading_style="ATX").strip()
+            if not converted:
+                converted = li.get_text(" ", strip=True)
+            results.append({"id": li.get('id') or f"fn-{i}", "num": i, "html": inner_html, "md": converted})
+    else:
+        # Try to detect child blocks inside footnotes_div
+        children = [c for c in footnotes_div.find_all(recursive=False) if getattr(c, 'name', None) in ('li','div','p')]
+        if children:
+            for i, el in enumerate(children, start=1):
+                for back in el.find_all('a'):
+                    href = (back.get('href') or "")
+                    cls = " ".join(back.get('class') or [])
+                    if href.startswith("#") or 'back' in cls.lower() or 'reverse' in cls.lower() or 'fnref' in cls.lower():
+                        back.decompose()
+                inner_html = "".join(str(c) for c in el.contents).strip()
+                converted = md(inner_html, heading_style="ATX").strip()
+                if not converted:
+                    converted = el.get_text(" ", strip=True)
+                results.append({"id": el.get('id') or f"fn-{i}", "num": i, "html": inner_html, "md": converted})
+        else:
+            # Fallback: treat entire div as single footnote
+            inner_html = "".join(str(c) for c in footnotes_div.contents).strip()
+            converted = md(inner_html, heading_style="ATX").strip()
+            if not converted:
+                converted = footnotes_div.get_text(" ", strip=True)
+            results.append({"id": footnotes_div.get('id') or "fn-1", "num": 1, "html": inner_html, "md": converted})
+
+    # remove footnotes div so it doesn't appear in main content
     footnotes_div.decompose()
     return results
 
-def find_and_replace_inline_refs(soup, footnote_entries):
+def replace_inline_footnote_refs(soup, footnotes):
     """
-    Replace inline anchor references to footnotes with plain bracketed numbers like [1].
-    We consider anchors with href starting with '#' and target id matching footnote_entries' ids
-    OR anchor text that's purely digits and links to '#fn...' style.
+    Replace inline anchors/sup that link to footnotes with plain [n].
+    Handles:
+      <a href="#fn1">1</a>, <sup><a href="#fn1">1</a></sup>, <a class="fnref" href="#...">, etc.
     """
-    id_to_num = {entry["id"]: entry["num"] for entry in footnote_entries}
-    # also accept variants without 'fn' prefix: build pattern of numbers present
-    known_nums = set(entry["num"] for entry in footnote_entries)
+    id_to_num = {entry['id']: entry['num'] for entry in footnotes}
+    known_nums = set(entry['num'] for entry in footnotes)
 
-    # find anchors that point to an ID in our footnotes or that look like footnote refs
-    anchors = list(soup.find_all("a"))
-    for a in anchors:
-        href = a.get("href") or ""
-        text = a.get_text("", strip=True) or ""
+    # Find anchors that look like footnote refs
+    for a in list(soup.find_all('a')):
+        href = (a.get('href') or "")
+        text = a.get_text("", strip=True)
+        cls = " ".join(a.get('class') or [])
         replaced = False
 
         if href.startswith("#"):
             target = href[1:]
-            # direct ID match
+            # direct id match
             if target in id_to_num:
                 num = id_to_num[target]
-                new_node = NavigableString(f"[{text or num}]")
-                a.replace_with(new_node)
+                a.replace_with(NavigableString(f"[{num}]"))
                 replaced = True
             else:
-                # sometimes footnote refs use fn1 or fn-1, try extract digits
-                m = re.search(r"(\d+)", target)
+                # try digits in target
+                m = re.search(r'(\d+)', target)
                 if m:
-                    num = int(m.group(1))
-                    if num in known_nums:
-                        new_node = NavigableString(f"[{text or num}]")
-                        a.replace_with(new_node)
+                    n = int(m.group(1))
+                    if n in known_nums:
+                        a.replace_with(NavigableString(f"[{n}]"))
                         replaced = True
 
-        # If href contains 'javascript' or links back to footnote ref text, but no '#', try text-only numeric anchors
-        if not replaced and text.isdigit():
-            # if anchor text is numeric and it's likely a footnote ref, replace
-            # We conservatively replace only if the anchor is small (no child tags) and short text
-            if len(text) <= 4:
-                new_node = NavigableString(f"[{text}]")
-                a.replace_with(new_node)
+        # If class indicates footnote reference or text is pure digit, conservatively replace
+        if not replaced and (re.search(r'fnref|footnote', cls, re.I) or text.isdigit()):
+            # ensure small anchor (not a long link)
+            if len(text) <= 6:
+                a.replace_with(NavigableString(f"[{text}]"))
                 replaced = True
 
-    return
+    # Also replace standalone <sup> that contain numbers (and no other content)
+    for s in list(soup.find_all('sup')):
+        txt = s.get_text("", strip=True)
+        if txt.isdigit() and len(txt) <= 4:
+            s.replace_with(NavigableString(f"[{txt}]"))
 
-def convert_and_write(soup, footnote_entries, output_file):
-    """
-    Convert the cleaned soup to markdown, then append footnotes in the requested format
-    (## Footnotes, then "[1] footnote text" entries). Write to output_file (overwrite).
-    """
-    # Heuristic: find main content (prefer <main>, <article>, else big candidate)
-    content_candidate = None
+def find_main_content(soup):
     if soup.find("main"):
-        content_candidate = soup.find("main")
-    elif soup.find("article"):
-        content_candidate = soup.find("article")
-    else:
-        # find large candidate by id/class or fallback to body
-        candidates = []
-        for attr in ("id","class"):
-            for name in ("content","main","page","article","container","wrapper","post","entry"):
-                found = soup.find(attrs={attr: lambda v: v and name in v})
-                if found and found.get_text(strip=True):
-                    candidates.append(found)
-        if candidates:
-            content_candidate = max(candidates, key=lambda t: len(t.get_text(" ", strip=True)))
-        else:
-            content_candidate = soup.body or soup
+        return soup.find("main")
+    if soup.find("article"):
+        return soup.find("article")
+    # fallback to large candidate
+    candidates = []
+    for attr in ("id","class"):
+        for name in ("content","main","page","article","container","wrapper","post","entry"):
+            found = soup.find(attrs={attr: lambda v: v and name in v})
+            if found and found.get_text(strip=True):
+                candidates.append(found)
+    if candidates:
+        return max(candidates, key=lambda t: len(t.get_text(" ", strip=True)))
+    return soup.body or soup
 
-    # Convert to markdown
-    html_content = str(content_candidate)
+def convert_and_write(soup, footnotes, output_file):
+    main = find_main_content(soup)
+    # remove nav/header/footer/aside in case present
+    for t in main.find_all(["nav","header","footer","aside"]):
+        t.decompose()
+
+    html_content = str(main)
     md_main = md(html_content, heading_style="ATX").strip()
 
-    # Build footnotes markdown (per-page)
-    foot_md = ""
-    if footnote_entries:
-        footlist_parts = []
-        for entry in footnote_entries:
-            # convert entry['html'] to markdown (strip potential leading numbers like "1." if present)
-            converted = md(entry["html"], heading_style="ATX").strip()
-            converted = re.sub(r'^\s*\d+\.\s*', '', converted)  # remove leading "1. " if any
-            footlist_parts.append(f"[{entry['num']}] {converted}")
-        foot_md = "\n\n## Footnotes\n\n" + "\n\n".join(footlist_parts)
-
-    # Remove the top page header that the previous scripts inserted (if present in MD),
-    # specifically a line like "## Kalash 1 / Vishram 1" at the very start.
-    # But since we operate on HTML before conversion, we've already removed h-tags; still do a safety cleanup:
+    # remove accidental leading "## Kalash / Vishram" headings produced earlier
     md_main = re.sub(r'^(#{1,6}\s*Kalash\s*\d+\s*/\s*Vishram\s*\d+\s*\n)+', '', md_main, flags=re.I)
 
-    # Final combined text
-    combined = md_main.strip()
+    foot_md = ""
+    if footnotes:
+        parts = []
+        for e in footnotes:
+            txt = e.get('md') or e.get('html') or ''
+            txt = txt.strip()
+            # Clean up text: remove leading numbering like "1." if present
+            txt = re.sub(r'^\s*\d+\.\s*', '', txt)
+            parts.append(f"[{e['num']}] {txt}")
+        foot_md = "\n\n## Footnotes\n\n" + "\n\n".join(parts)
+
+    combined = md_main
     if foot_md:
         combined = combined + "\n\n" + foot_md
-
-    # Tidy up extra blank lines
     combined = re.sub(r'\n{3,}', '\n\n', combined)
 
-    # Write file
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(combined)
     print("Wrote:", output_file)
@@ -227,29 +255,29 @@ def process_one_page(url, output_file):
     soup = BeautifulSoup(html, "lxml")
 
     # Remove top Kalash/Vishram heading if present
-    removed_top = remove_top_kalash_heading(soup)
-    if removed_top:
+    if remove_top_kalash_heading(soup):
         print("Removed top Kalash/Vishram heading")
 
-    # Remove the nav table if present
-    removed_table = remove_nav_table(soup)
-    if removed_table:
-        print("Removed bottom navigation table")
+    # More aggressive nav removals
+    if remove_nav_table(soup):
+        print("Removed bottom nav table (style/nav links)")
+    if remove_large_nav_blocks(soup):
+        print("Removed large navigation blocks (many small links)")
 
     # Extract footnotes and remove the footnotes div
     footnotes = extract_footnotes(soup)
     if footnotes:
-        print(f"Found {len(footnotes)} footnotes")
+        print(f"Extracted {len(footnotes)} footnotes")
 
-    # Replace inline footnote links with [n]
-    find_and_replace_inline_refs(soup, footnotes)
+    # Replace inline refs like <a href="#fn1">1</a> or <sup><a>1</a></sup> with [1]
+    replace_inline_footnote_refs(soup, footnotes)
 
-    # Convert to markdown and write
+    # Final convert and write file
     convert_and_write(soup, footnotes, output_file)
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python extract_harililamrut_onepage.py <URL> [output.md]")
+        print("Usage: python extract_harililamrut_onepage_v2.py <URL> [output.md]")
         sys.exit(1)
     url = sys.argv[1]
     out = sys.argv[2] if len(sys.argv) > 2 else "page_harililamrut.md"
