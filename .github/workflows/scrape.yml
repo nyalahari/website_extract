@@ -33,7 +33,7 @@ jobs:
       env:
         URL: "https://www.anirdesh.com/harililamrut/index.php?kalash=1&vishram=1"
       run: |
-        python fetch_to_md.py "$URL" harililamrut_kalash1_vishram1.md
+        python fetch_to_md.py "$URL" all_harililamrut.md
 
     - name: Commit generated markdown
       run: |
