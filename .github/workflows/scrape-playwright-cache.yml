@@ -1,0 +1,77 @@
+name: Scrape Harililamrut (Playwright + Cache)
+
+# manual run + scheduled daily at 02:00 UTC (edit or remove schedule as you like)
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install apt system packages (needed for Playwright browsers)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgbm-dev libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxss1 libasound2 libx11-dev libxkbfile1 libxcb1 libxcomposite1 libxdamage1 libxrandr2 libxfixes3 libxext6
+
+      - name: Install Python dependencies (pip)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir playwright beautifulsoup4 lxml markdownify
+
+      - name: Cache Playwright browser binaries (~/.cache/ms-playwright)
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # include runner.os + hash of requirements + script so that the cache updates when code/deps change
+          key: ${{ runner.os }}-playwright-${{ hashFiles('**/requirements.txt','**/extract_harililamrut_playwright.py','**/extract_harililamrut_resilient.py') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-
+
+      - name: Install Playwright browsers (cache-miss -> install browsers + deps; cache-hit -> ensure deps)
+        run: |
+          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != 'true' ]; then
+            echo "Cache miss: installing Playwright browsers (with deps)..."
+            python -m playwright install --with-deps
+          else
+            echo "Cache hit: skipping browser download, ensuring OS deps are installed..."
+            # Install only system deps (no browser download)
+            python -m playwright install-deps || true
+          fi
+
+      - name: Run Playwright scraper (render JS and extract)
+        env:
+          URL: "https://anirdesh.com/harililamrut/index.php?kalash=1&vishram=1"
+        run: |
+          # run your Playwright script; adjust filename if you named it differently
+          python extract_harililamrut_playwright.py "$URL" page_harililamrut.md
+
+      - name: Commit and push extracted markdown (if changed)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Automated: update extracted Harililamrut (Playwright)"
+            git push origin HEAD:main
+          fi
