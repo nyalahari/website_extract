@@ -1,6 +1,4 @@
-# કળશ ૧ / વિશ્રામ ૧ //  શ્રીહરિલીલામૃત - Shri Harililamrut // Anirdesh.com
-
-# Harililamrut
+# Harililamrut — Kalash 1 / Vishram 1
 
 # કળશ ૧
 
@@ -309,3 +307,5 @@
 | * [Vachanamrut](../vachanamrut/ "Vachanamrut") * [Swamini Vato](../vato/ "Swamini Vato") * [Kirtan Muktavali](../kirtan/ "Kirtan Muktavali") | * [Nishkulanand Kavya](../kavya/ "Nishkulanand Kavya") * [Aksharamrutam](../aksharamrutam/) * [Bhaktachintamani](../chintamani/) | * [Bhagwad Gita](../gita/) * [Bhagvat Purana](../bhagvat/) * [Feedback](../feedback.php?s=Harililamrut&f=index.php "Send me feedback") |
 
 [Anirdesh.com ©2018](../)
+
+## Footnotes
